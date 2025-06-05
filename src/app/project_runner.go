@@ -28,27 +28,28 @@ func (e *ExitError) Error() string {
 }
 
 type ProjectRunner struct {
-	procConfMutex     sync.Mutex
-	project           *types.Project
-	logsMutex         sync.Mutex
-	processLogs       map[string]*pclog.ProcessLogBuffer
-	statesMutex       sync.Mutex
-	processStates     map[string]*types.ProcessState
-	runProcMutex      sync.Mutex
-	runningProcesses  map[string]*Process
-	restartMutex      sync.Mutex
-	restartLocks      map[string]*sync.Mutex
-	logger            pclog.PcLogger
-	waitGroup         sync.WaitGroup
-	exitCode          int
-	projectState      *types.ProjectState
-	mainProcess       string
-	mainProcessArgs   []string
-	isTuiOn           bool
-	isOrderedShutDown bool
-	ctxApp            context.Context
-	cancelAppFn       context.CancelFunc
-	disableDotenv     bool
+	procConfMutex       sync.Mutex
+	project             *types.Project
+	logsMutex           sync.Mutex
+	processLogs         map[string]*pclog.ProcessLogBuffer
+	statesMutex         sync.Mutex
+	processStates       map[string]*types.ProcessState
+	runProcMutex        sync.Mutex
+	runningProcesses    map[string]*Process
+	restartMutex        sync.Mutex
+	restartInProgress   map[string]bool
+	restartWaitChannels map[string][]chan error
+	logger              pclog.PcLogger
+	waitGroup           sync.WaitGroup
+	exitCode            int
+	projectState        *types.ProjectState
+	mainProcess         string
+	mainProcessArgs     []string
+	isTuiOn             bool
+	isOrderedShutDown   bool
+	ctxApp              context.Context
+	cancelAppFn         context.CancelFunc
+	disableDotenv       bool
 }
 
 func (p *ProjectRunner) GetLexicographicProcessNames() ([]string, error) {
@@ -62,7 +63,7 @@ func (p *ProjectRunner) WithProcesses(names []string, fn func(process types.Proc
 func (p *ProjectRunner) init() {
 	p.initProcessStates()
 	p.initProcessLogs()
-	p.initRestartLocks()
+	p.initRestartCoalescing()
 }
 
 func (p *ProjectRunner) Run() error {
@@ -219,20 +220,9 @@ func (p *ProjectRunner) initProcessLogs() {
 	}
 }
 
-func (p *ProjectRunner) initRestartLocks() {
-	p.restartLocks = make(map[string]*sync.Mutex)
-}
-
-func (p *ProjectRunner) getRestartLock(name string) *sync.Mutex {
-	p.restartMutex.Lock()
-	defer p.restartMutex.Unlock()
-	
-	if lock, exists := p.restartLocks[name]; exists {
-		return lock
-	}
-	
-	p.restartLocks[name] = &sync.Mutex{}
-	return p.restartLocks[name]
+func (p *ProjectRunner) initRestartCoalescing() {
+	p.restartInProgress = make(map[string]bool)
+	p.restartWaitChannels = make(map[string][]chan error)
 }
 
 func (p *ProjectRunner) initProcessLog(name string) {
@@ -374,11 +364,42 @@ func (p *ProjectRunner) StopProcesses(names []string) (map[string]string, error)
 }
 
 func (p *ProjectRunner) RestartProcess(name string) error {
-	// Get per-process restart lock to prevent concurrent restarts of the same process
-	restartLock := p.getRestartLock(name)
-	restartLock.Lock()
-	defer restartLock.Unlock()
+	// Check if restart is already in progress for this process
+	p.restartMutex.Lock()
+	if p.restartInProgress[name] {
+		// Restart already in progress, wait for it to complete (coalescing)
+		waitChan := make(chan error, 1)
+		p.restartWaitChannels[name] = append(p.restartWaitChannels[name], waitChan)
+		p.restartMutex.Unlock()
 
+		log.Debug().Msgf("Restart already in progress for %s, waiting for completion", name)
+		return <-waitChan
+	}
+
+	// Mark restart as in progress
+	p.restartInProgress[name] = true
+	p.restartMutex.Unlock()
+
+	// Perform the actual restart
+	err := p.doRestart(name)
+
+	// Notify all waiting restart requests
+	p.restartMutex.Lock()
+	waiters := p.restartWaitChannels[name]
+	p.restartWaitChannels[name] = nil
+	p.restartInProgress[name] = false
+	p.restartMutex.Unlock()
+
+	// Send result to all waiting goroutines
+	for _, waitChan := range waiters {
+		waitChan <- err
+		close(waitChan)
+	}
+
+	return err
+}
+
+func (p *ProjectRunner) doRestart(name string) error {
 	log.Debug().Msgf("Restarting %s", name)
 	proc := p.getRunningProcess(name)
 	if proc != nil {
