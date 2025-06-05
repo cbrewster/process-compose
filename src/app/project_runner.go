@@ -36,6 +36,8 @@ type ProjectRunner struct {
 	processStates     map[string]*types.ProcessState
 	runProcMutex      sync.Mutex
 	runningProcesses  map[string]*Process
+	restartMutex      sync.Mutex
+	restartLocks      map[string]*sync.Mutex
 	logger            pclog.PcLogger
 	waitGroup         sync.WaitGroup
 	exitCode          int
@@ -60,6 +62,7 @@ func (p *ProjectRunner) WithProcesses(names []string, fn func(process types.Proc
 func (p *ProjectRunner) init() {
 	p.initProcessStates()
 	p.initProcessLogs()
+	p.initRestartLocks()
 }
 
 func (p *ProjectRunner) Run() error {
@@ -216,6 +219,22 @@ func (p *ProjectRunner) initProcessLogs() {
 	}
 }
 
+func (p *ProjectRunner) initRestartLocks() {
+	p.restartLocks = make(map[string]*sync.Mutex)
+}
+
+func (p *ProjectRunner) getRestartLock(name string) *sync.Mutex {
+	p.restartMutex.Lock()
+	defer p.restartMutex.Unlock()
+	
+	if lock, exists := p.restartLocks[name]; exists {
+		return lock
+	}
+	
+	p.restartLocks[name] = &sync.Mutex{}
+	return p.restartLocks[name]
+}
+
 func (p *ProjectRunner) initProcessLog(name string) {
 	p.processLogs[name] = pclog.NewLogBuffer(p.project.LogLength)
 }
@@ -355,6 +374,11 @@ func (p *ProjectRunner) StopProcesses(names []string) (map[string]string, error)
 }
 
 func (p *ProjectRunner) RestartProcess(name string) error {
+	// Get per-process restart lock to prevent concurrent restarts of the same process
+	restartLock := p.getRestartLock(name)
+	restartLock.Lock()
+	defer restartLock.Unlock()
+
 	log.Debug().Msgf("Restarting %s", name)
 	proc := p.getRunningProcess(name)
 	if proc != nil {
